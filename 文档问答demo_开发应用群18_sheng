@@ -1,0 +1,485 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "cbe0644c",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "* text=auto"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "adba6512",
+   "metadata": {},
+   "source": [
+    "## 模块功能"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 65,
+   "id": "0beffa58",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import os\n",
+    "import openai\n",
+    "from openai.embeddings_utils import get_embedding, cosine_similarity\n",
+    "from qdrant_client import QdrantClient\n",
+    "from qdrant_client.models import Distance, VectorParams\n",
+    "from transformers import GPT2Tokenizer\n",
+    "import pnlp\n",
+    "tokenizer = GPT2Tokenizer.from_pretrained(\"gpt2\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "e9378977",
+   "metadata": {},
+   "source": [
+    " ### api设置"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 82,
+   "id": "8e735a1e",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')\n",
+    "openai.api_key = OPENAI_API_KEY"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "fdd85a4d",
+   "metadata": {},
+   "source": [
+    " ### 文档读取"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 83,
+   "id": "a6a2dbc4",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def read_document(file_path):\n",
+    "    try:\n",
+    "        with open(file_path, 'r') as file:\n",
+    "            content = file.read()\n",
+    "            \n",
+    "    except UnicodeDecodeError:\n",
+    "        with open(file_path, 'r', encoding='utf-8') as file:\n",
+    "            content = file.read()\n",
+    "        \n",
+    "    return content"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "50ec1855",
+   "metadata": {},
+   "source": [
+    " ### 批量embedding"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 84,
+   "id": "27815605",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def get_embedding_direct(inputs):\n",
+    "    embed_model = \"text-embedding-ada-002\"\n",
+    "\n",
+    "    res = openai.Embedding.create(\n",
+    "        input=inputs, engine=embed_model\n",
+    "    )\n",
+    "    return res"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "45abff8d",
+   "metadata": {},
+   "source": [
+    " ### 段落划分"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 85,
+   "id": "2751b4eb",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def get_paragragphs(text):\n",
+    "    paragraphs = [para for para in text.split('\\n') if para]\n",
+    "\n",
+    "    ntokens = []\n",
+    "    for paragraph in paragraphs:\n",
+    "        if paragraph:\n",
+    "            ntokens.append(len(tokenizer.encode(paragraph)))\n",
+    "    max_tokens = max(ntokens)\n",
+    "    \n",
+    "    return paragraphs, ntokens, max_tokens"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "50f63517",
+   "metadata": {},
+   "source": [
+    " ### 段落分组"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 86,
+   "id": "16b66283",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def group_paragraphs(paragraphs, ntokens, max_len=1000):\n",
+    "    \"\"\"\n",
+    "    合并短段落为文本块，用于丰富上下文语境，提升文本连贯性，并提升运算效率。\n",
+    "    :param paragraphs: 段落集合 (原始文本的所有段落)\n",
+    "    :param ntokens: token数集合 (原始文本中每个段落的token数)\n",
+    "    :param max_len: 最大文本块token数\n",
+    "    :return: 组合好的文本块\n",
+    "    \"\"\"\n",
+    "    batches = []\n",
+    "    cur_batch = \"\"\n",
+    "    cur_tokens = 0\n",
+    "\n",
+    "    # 对于每个文本段落做处理\n",
+    "    for paragraph, ntoken in zip(paragraphs, ntokens):\n",
+    "        if ntoken + cur_tokens + 1 > max_len:  # '1' 指的是'\\n'\n",
+    "            # 如果加入这段文本，总token数超过阈值，则开启新的文本块\n",
+    "            batches.append(cur_batch)\n",
+    "            cur_batch = paragraph\n",
+    "            cur_tokens = ntoken\n",
+    "        else:\n",
+    "            # 否则将段落插入文本块中\n",
+    "            cur_batch += \"\\n\" + paragraph\n",
+    "            cur_tokens += (1 + ntoken)\n",
+    "    batches.append(cur_batch)  # 记录最后一个文本块\n",
+    "    return batches"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "5abc4ddf",
+   "metadata": {},
+   "source": [
+    " ### 创建payload数据"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 87,
+   "id": "92567f55",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def get_payload(text):\n",
+    "    paragraphs, ntokens, max_tokens = get_paragragphs(text)\n",
+    "    batchs = group_paragraphs(paragraphs, ntokens, max_len=max_tokens)\n",
+    "#     print('文本块数: ', len(batchs))\n",
+    "\n",
+    "    contents= []\n",
+    "    payload = []\n",
+    "    for batch in batchs:\n",
+    "        contents.append(batch)\n",
+    "        data_dict = {\"content\": batch, \"tokens\": len(tokenizer.encode(batch))}\n",
+    "        payload.append(data_dict)\n",
+    "    return payload, contents"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "889ac3d8",
+   "metadata": {},
+   "source": [
+    " ### 分批转成嵌入向量"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 88,
+   "id": "0388c1cc",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def generate_embeddings(contents):\n",
+    "    embs = []\n",
+    "    for idx, batch in enumerate(pnlp.generate_batches_by_size(contents, 200)):\n",
+    "        response = get_embedding_direct(batch)\n",
+    "        for v in response.data:\n",
+    "            embs.append(v.embedding)\n",
+    "\n",
+    "    return embs"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "e0169029",
+   "metadata": {},
+   "source": [
+    " ### 向量入库"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 95,
+   "id": "af1c9bd9",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def qdrant_search(embs, payload, query):\n",
+    "\n",
+    "    client = QdrantClient(host=\"localhost\", port=6333)\n",
+    "\n",
+    "\n",
+    "    client.recreate_collection(\n",
+    "        collection_name=\"doc_qa\",\n",
+    "        vectors_config=VectorParams(size=1536, distance=Distance.COSINE),\n",
+    "    )\n",
+    "\n",
+    "\n",
+    "    # Qdrant向量入库\n",
+    "    client.upload_collection(\n",
+    "        collection_name=\"doc_qa\",\n",
+    "        vectors=embs,\n",
+    "        payload=payload\n",
+    "    )\n",
+    "    \n",
+    "    return client"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "88f12f36",
+   "metadata": {},
+   "source": [
+    " ### 构建提示词"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 108,
+   "id": "b8f3b5a6",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def construct_prompt(client, question: str):\n",
+    "    # 参数设定\n",
+    "    MAX_SECTION_LEN = 2048  # 500\n",
+    "    SEPARATOR = \"\\n* \"\n",
+    "    separator_len = 3\n",
+    "\n",
+    "    query_vector = get_embedding(question, engine=\"text-embedding-ada-002\")\n",
+    "    hits = client.search(\n",
+    "        collection_name=\"doc_qa\",\n",
+    "        query_vector=query_vector,\n",
+    "        limit=5,\n",
+    "        sort_by_distance=True\n",
+    "    )\n",
+    "    \n",
+    "    choose = []\n",
+    "    length = 0\n",
+    "\n",
+    "    for hit in hits:\n",
+    "\n",
+    "        doc = hit.payload\n",
+    "        length += doc[\"tokens\"] + separator_len\n",
+    "        if length > MAX_SECTION_LEN:\n",
+    "            break\n",
+    "            \n",
+    "        choose.append(SEPARATOR + doc[\"content\"].replace(\"\\n\", \" \"))\n",
+    "    \n",
+    "    header = \"\"\"Answer the question as truthfully as possible using the provided context, and if the answer is not contained within the text below, say \"I don't know.\"\\n\\nContext:\\n\"\"\"\n",
+    "    \n",
+    "    return header + \"\".join(choose) + \"\\n\\n Q: \" + question + \"\\n A:\""
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "b49ad5c0",
+   "metadata": {},
+   "source": [
+    "### 创建complete模型"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 109,
+   "id": "4d77b708",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def complete(prompt):\n",
+    "    response = openai.Completion.create(\n",
+    "        prompt=prompt,\n",
+    "        temperature=0,\n",
+    "        max_tokens=300,\n",
+    "        top_p=1,\n",
+    "        frequency_penalty=0,\n",
+    "        presence_penalty=0,\n",
+    "        model=\"text-davinci-003\"\n",
+    "    )\n",
+    "    ans = response[\"choices\"][0][\"text\"].strip(\" \\n\")\n",
+    "    return ans"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "0bef2de0",
+   "metadata": {},
+   "source": [
+    " ### 提问回答"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 110,
+   "id": "e9e5fb5e",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def ask(content):\n",
+    "    response = openai.ChatCompletion.create(\n",
+    "        model=\"gpt-3.5-turbo\", \n",
+    "        messages=[{\"role\": \"user\", \"content\": content}]\n",
+    "    )\n",
+    "\n",
+    "    ans = response.get(\"choices\")[0].get(\"message\").get(\"content\")\n",
+    "    return ans"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "327644ae",
+   "metadata": {},
+   "source": [
+    "## 主函数 "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 111,
+   "id": "45451af3",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def run(file_path):\n",
+    "    # 读取文档\n",
+    "    doc_text = read_document(file_path)\n",
+    "    \n",
+    "    # 准备数据\n",
+    "    payload, contents = get_payload(doc_text)\n",
+    "    \n",
+    "    # 生成嵌入向量\n",
+    "    embs = generate_embeddings(contents)\n",
+    "\n",
+    "    while True:\n",
+    "        # 输入问题\n",
+    "        query = input(\"question：\")\n",
+    "        \n",
+    "        if query.upper() == 'Q':\n",
+    "            break\n",
+    "            \n",
+    "        # 向量搜索\n",
+    "        client = qdrant_search(embs, payload, query)\n",
+    "\n",
+    "        prompt = construct_prompt(client,query)\n",
+    "        # print(\"===\\n\", prompt)\n",
+    "\n",
+    "        ans = complete(prompt)\n",
+    "\n",
+    "        print('answer：', ans)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 112,
+   "id": "8c30f9d2",
+   "metadata": {
+    "scrolled": false
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "question：太阳能的优势是什么？\n",
+      "answer： 太阳能的优势是可以减少对化石燃料的依赖，降低温室气体排放，保护环境。\n",
+      "question：太阳能利用的原理有哪两种？\n",
+      "answer： 光热转换和光电转换。\n",
+      "question：什么是光热转换？\n",
+      "answer： 光热转换是指太阳光被物体吸收后转化为热能。\n",
+      "question：什么是光电转换？\n",
+      "answer： 光电转换是指太阳光照射在光电材料表面产生电流。\n",
+      "question：太阳能应用的三个主要领域是什么？\n",
+      "answer： 太阳能发电、太阳能热水器和太阳能光热系统。\n",
+      "question：什么是光伏发电？\n",
+      "answer： 光伏发电是利用太阳能电池把太阳光直接转化为电能的过程。\n",
+      "question：什么是推荐算法\n",
+      "answer： I don't know.\n",
+      "question：q\n"
+     ]
+    }
+   ],
+   "source": [
+    "file_path = 'doc.txt'\n",
+    "run(file_path)"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "venv_dl",
+   "language": "python",
+   "name": "venv_dl"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.10.10"
+  },
+  "toc": {
+   "base_numbering": 1,
+   "nav_menu": {},
+   "number_sections": true,
+   "sideBar": true,
+   "skip_h1_title": false,
+   "title_cell": "Table of Contents",
+   "title_sidebar": "Contents",
+   "toc_cell": false,
+   "toc_position": {
+    "height": "896.667px",
+    "left": "212px",
+    "top": "110.116px",
+    "width": "175.634px"
+   },
+   "toc_section_display": true,
+   "toc_window_display": true
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
